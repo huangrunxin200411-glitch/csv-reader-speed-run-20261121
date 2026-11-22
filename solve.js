@@ -1,9 +1,11 @@
-// Fast drop-in for csv-reader 1.0.0 (make.fun csv-reader-speed-01) — v3.
-// v2 inlined: the per-field helper calls and their 3-element array returns
-// are gone. The common unquoted field is one native regex scan + one slice
-// inside the record loop; quoted segments skip the norm() call unless they
-// actually hold CR/LF. Same answers as the reference; pure, no state kept
-// between calls.
+// Fast drop-in for csv-reader 1.0.0 (make.fun csv-reader-speed-01) — v4.
+// v3 inlined the per-field helpers; v4 removes the last native-call cost in
+// the hot path: an unquoted field is found with two indexOf scans (',' and
+// LF) instead of one regex exec, so no match array is allocated per field.
+// A CR inside the field is rare (a few dozen per case); only then does the
+// careful regex scan run. Quoted segments also skip the norm() call unless
+// they actually hold CR/LF. Same answers as the reference; pure, no state
+// kept between calls except nothing at all.
 //
 // Semantics (from the reference): BOM dropped; records end at LF/CRLF, empty
 // lines are no record; lone CR outside quotes is dropped (stray_cr); a field
@@ -56,15 +58,10 @@ export function run(input) {
     return out + s.slice(start);
   }
 
-  // Fast path for a quoted segment: no CR/LF means no normalization.
-  function normSeg(s) {
-    if (s.indexOf('\r') === -1 && s.indexOf('\n') === -1) return s;
-    return norm(s);
-  }
-
-  // One native regex scan per unquoted field. Rare paths only (junk after a
-  // closing quote, re-read after an unterminated quote); the hot unquoted
-  // path is inlined in the record loop below. Writes uVal/uEnd/uAdded.
+  // One native regex scan per unquoted field. Rare paths only (a CR inside
+  // an unquoted field, junk after a closing quote, re-read after an
+  // unterminated quote); the hot unquoted path is inlined in the record
+  // loop below. Writes uVal/uEnd/uAdded.
   const DELIM = /[,\n\r]/g;
   let uVal = '';
   let uEnd = END;
@@ -136,12 +133,14 @@ export function run(input) {
             break;
           }
           if (q + 1 < n && text.charCodeAt(q + 1) === 34) {
-            v += normSeg(text.slice(segStart, q)) + '"';
+            const seg = text.slice(segStart, q);
+            v += (seg.indexOf('\r') === -1 && seg.indexOf('\n') === -1 ? seg : norm(seg)) + '"';
             pos = q + 2;
             segStart = pos;
             continue;
           }
-          v += normSeg(text.slice(segStart, q));
+          const seg = text.slice(segStart, q);
+          v += seg.indexOf('\r') === -1 && seg.indexOf('\n') === -1 ? seg : norm(seg);
           pos = q + 1;
           closed = true;
           break;
@@ -165,33 +164,35 @@ export function run(input) {
         }
       } else {
         quoted = false;
-        // Hot path: unquoted field, inlined. One regex scan per segment;
-        // usually a single segment ending at a comma or line break.
-        let v = '';
-        while (true) {
-          if (pos >= n) { ended = END; break; }
-          DELIM.lastIndex = pos;
-          const m = DELIM.exec(text);
-          if (m === null) {
-            v += text.slice(pos); pos = n; ended = END; break;
+        // Hot path: unquoted field via two indexOf scans, no regex match
+        // object. The field ends at the nearest ',' or LF (or EOF); a CR
+        // inside it is rare and falls back to the careful scan.
+        if (pos >= n) {
+          val = ''; ended = END;
+        } else {
+          const cIdx = text.indexOf(',', pos);
+          const nIdx = text.indexOf('\n', pos);
+          let end;
+          let isComma;
+          if (cIdx === -1 && nIdx === -1) { end = n; isComma = false; }
+          else if (nIdx === -1 || (cIdx !== -1 && cIdx < nIdx)) { end = cIdx; isComma = true; }
+          else { end = nIdx; isComma = false; }
+          const seg = text.slice(pos, end);
+          const cr = seg.indexOf('\r');
+          if (cr === -1) {
+            val = seg;
+            if (end >= n) { pos = n; ended = END; }
+            else if (isComma) { pos = end + 1; ended = COMMA; }
+            else { pos = end + 1; line++; ended = LINE_BREAK; }
+          } else if (!isComma && end < n && cr === seg.length - 1) {
+            // CRLF: the CR is the last char before the LF.
+            val = seg.slice(0, seg.length - 1);
+            pos = end + 1; line++; ended = LINE_BREAK;
+          } else {
+            readUnquoted('');
+            val = uVal; ended = uEnd;
           }
-          const idx = m.index;
-          const ch = m[0];
-          if (ch === '\r') {
-            if (idx + 1 < n && text.charCodeAt(idx + 1) === 10) {
-              v += text.slice(pos, idx);
-              pos = idx + 2; line++; ended = LINE_BREAK; break;
-            }
-            errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
-            v += text.slice(pos, idx);
-            pos = idx + 1;
-            continue;
-          }
-          v += text.slice(pos, idx);
-          if (ch === ',') { pos = idx + 1; ended = COMMA; break; }
-          pos = idx + 1; line++; ended = LINE_BREAK; break;
         }
-        val = v;
       }
       fields.push(val);
     } while (ended === COMMA);
