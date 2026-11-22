@@ -1,12 +1,15 @@
-// Fast drop-in for csv-reader 1.0.0 (make.fun csv-reader-speed-01).
-// Same answers as the reference, faster: indexOf/slice fast paths instead of
-// one-character-at-a-time string building. Pure, no state kept between calls.
+// Fast drop-in for csv-reader 1.0.0 (make.fun csv-reader-speed-01) — v3.
+// v2 inlined: the per-field helper calls and their 3-element array returns
+// are gone. The common unquoted field is one native regex scan + one slice
+// inside the record loop; quoted segments skip the norm() call unless they
+// actually hold CR/LF. Same answers as the reference; pure, no state kept
+// between calls.
 //
 // Semantics (from the reference): BOM dropped; records end at LF/CRLF, empty
 // lines are no record; lone CR outside quotes is dropped (stray_cr); a field
 // opening with a quote runs to the next non-doubled quote, "" inside is one
 // quote, CRLF/lone CR inside is LF; text after the closing quote up to the
-// next comma/line break is appended as-is (quote_junk); a quote that never
+// next comma/line-break is appended as-is (quote_junk); a quote that never
 // closes is literal and the rest is re-read unquoted (unterminated_quote);
 // a quote inside an unquoted field is literal; fields stay strings; rows
 // are padded (short_row) or cut (long_row) to the first record's width;
@@ -33,9 +36,8 @@ export function run(input) {
   let recordRow = null;
 
   // Normalize CR/LF inside a quoted segment to LF, counting lines.
-  // Returns the normalized segment; fast path when it holds neither.
+  // Only called when the segment actually holds CR or LF.
   function norm(s) {
-    if (s.indexOf('\r') === -1 && s.indexOf('\n') === -1) return s;
     let out = '';
     let start = 0;
     for (let i = 0; i < s.length; i++) {
@@ -54,10 +56,19 @@ export function run(input) {
     return out + s.slice(start);
   }
 
-  // Read an unquoted field starting at pos, with `init` as its starting
-  // value. Returns [value, ended, added] where added counts kept chars.
-  // One native regex scan per field instead of three indexOf scans.
+  // Fast path for a quoted segment: no CR/LF means no normalization.
+  function normSeg(s) {
+    if (s.indexOf('\r') === -1 && s.indexOf('\n') === -1) return s;
+    return norm(s);
+  }
+
+  // One native regex scan per unquoted field. Rare paths only (junk after a
+  // closing quote, re-read after an unterminated quote); the hot unquoted
+  // path is inlined in the record loop below. Writes uVal/uEnd/uAdded.
   const DELIM = /[,\n\r]/g;
+  let uVal = '';
+  let uEnd = END;
+  let uAdded = 0;
   function readUnquoted(init) {
     let v = init;
     let added = 0;
@@ -66,7 +77,8 @@ export function run(input) {
       const m = DELIM.exec(text);
       if (m === null) {
         v += text.slice(pos); added += n - pos; pos = n;
-        return [v, END, added];
+        uVal = v; uEnd = END; uAdded = added;
+        return;
       }
       const idx = m.index;
       const ch = m[0];
@@ -74,7 +86,8 @@ export function run(input) {
         if (idx + 1 < n && text.charCodeAt(idx + 1) === 10) {
           v += text.slice(pos, idx); added += idx - pos;
           pos = idx + 2; line++;
-          return [v, LINE_BREAK, added];
+          uVal = v; uEnd = LINE_BREAK; uAdded = added;
+          return;
         }
         errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
         v += text.slice(pos, idx); added += idx - pos;
@@ -82,50 +95,12 @@ export function run(input) {
         continue;
       }
       v += text.slice(pos, idx); added += idx - pos;
-      if (ch === ',') { pos = idx + 1; return [v, COMMA, added]; }
+      if (ch === ',') { pos = idx + 1; uVal = v; uEnd = COMMA; uAdded = added; return; }
       pos = idx + 1; line++;
-      return [v, LINE_BREAK, added];
+      uVal = v; uEnd = LINE_BREAK; uAdded = added;
+      return;
     }
-    return [v, END, added];
-  }
-
-  // Read a quoted field whose opening quote is at pos.
-  // Returns [value, ended, added] (added is unused for quoted fields).
-  function readQuoted() {
-    const open = pos;
-    const openLine = line;
-    pos++;
-    let v = '';
-    let segStart = pos;
-    while (true) {
-      const q = text.indexOf('"', pos);
-      if (q === -1) {
-        pos = open + 1;
-        line = openLine;
-        errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
-        return readUnquoted('"');
-      }
-      if (q + 1 < n && text.charCodeAt(q + 1) === 34) {
-        v += norm(text.slice(segStart, q)) + '"';
-        pos = q + 2;
-        segStart = pos;
-        continue;
-      }
-      v += norm(text.slice(segStart, q));
-      pos = q + 1;
-      break;
-    }
-    if (pos >= n) return [v, END, 0];
-    const c = text.charCodeAt(pos);
-    if (c === 44) { pos++; return [v, COMMA, 0]; }
-    if (c === 10) { pos++; line++; return [v, LINE_BREAK, 0]; }
-    if (c === 13 && pos + 1 < n && text.charCodeAt(pos + 1) === 10) {
-      pos += 2; line++;
-      return [v, LINE_BREAK, 0];
-    }
-    const junk = readUnquoted(v);
-    if (junk[2] > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
-    return junk;
+    uVal = v; uEnd = END; uAdded = added;
   }
 
   while (true) {
@@ -143,16 +118,82 @@ export function run(input) {
     let ended;
     let quoted = false;
     do {
-      let r;
+      let val;
       if (text.charCodeAt(pos) === 34) {
         quoted = true;
-        r = readQuoted();
+        const open = pos;
+        const openLine = line;
+        pos++;
+        let v = '';
+        let segStart = pos;
+        let closed = false;
+        while (true) {
+          const q = text.indexOf('"', pos);
+          if (q === -1) {
+            pos = open + 1;
+            line = openLine;
+            errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
+            break;
+          }
+          if (q + 1 < n && text.charCodeAt(q + 1) === 34) {
+            v += normSeg(text.slice(segStart, q)) + '"';
+            pos = q + 2;
+            segStart = pos;
+            continue;
+          }
+          v += normSeg(text.slice(segStart, q));
+          pos = q + 1;
+          closed = true;
+          break;
+        }
+        if (!closed) {
+          readUnquoted('"');
+          val = uVal; ended = uEnd;
+        } else if (pos >= n) {
+          val = v; ended = END;
+        } else {
+          const c = text.charCodeAt(pos);
+          if (c === 44) { pos++; val = v; ended = COMMA; }
+          else if (c === 10) { pos++; line++; val = v; ended = LINE_BREAK; }
+          else if (c === 13 && pos + 1 < n && text.charCodeAt(pos + 1) === 10) {
+            pos += 2; line++; val = v; ended = LINE_BREAK;
+          } else {
+            readUnquoted(v);
+            if (uAdded > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
+            val = uVal; ended = uEnd;
+          }
+        }
       } else {
         quoted = false;
-        r = readUnquoted('');
+        // Hot path: unquoted field, inlined. One regex scan per segment;
+        // usually a single segment ending at a comma or line break.
+        let v = '';
+        while (true) {
+          if (pos >= n) { ended = END; break; }
+          DELIM.lastIndex = pos;
+          const m = DELIM.exec(text);
+          if (m === null) {
+            v += text.slice(pos); pos = n; ended = END; break;
+          }
+          const idx = m.index;
+          const ch = m[0];
+          if (ch === '\r') {
+            if (idx + 1 < n && text.charCodeAt(idx + 1) === 10) {
+              v += text.slice(pos, idx);
+              pos = idx + 2; line++; ended = LINE_BREAK; break;
+            }
+            errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
+            v += text.slice(pos, idx);
+            pos = idx + 1;
+            continue;
+          }
+          v += text.slice(pos, idx);
+          if (ch === ',') { pos = idx + 1; ended = COMMA; break; }
+          pos = idx + 1; line++; ended = LINE_BREAK; break;
+        }
+        val = v;
       }
-      fields.push(r[0]);
-      ended = r[1];
+      fields.push(val);
     } while (ended === COMMA);
 
     if (fields.length === 1 && fields[0] === '' && !quoted) continue;
